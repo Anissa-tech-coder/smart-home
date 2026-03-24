@@ -1,6 +1,7 @@
 """
 Module de génération d'actions
 Version compatible avec la nouvelle structure de Naila
+⭐ VERSION CORRIGÉE - Génération intelligente + validation
 """
 
 from typing import List, Dict, Any, Optional
@@ -99,10 +100,7 @@ class Action:
         }
     
     def to_mqtt_message(self) -> Dict:
-        """
-        Format pour Naila (SAC) avec index
-        ⚠️ ATTENTION : Ce message va UNIQUEMENT à Naila, pas à Nadine !
-        """
+        """Format pour Naila (SAC) avec index"""
         return {
             "action_id": self.action_id,
             "action_type": self.action_type.value,
@@ -123,7 +121,7 @@ class Action:
 class ActionGenerator:
     """
     Génère des actions adaptées au profil utilisateur
-    Version compatible avec la nouvelle structure de Naila
+    ⭐ VERSION CORRIGÉE - Validation d'état intégrée
     """
     
     def __init__(self, profiler: AdaptiveUserProfiler = None):
@@ -143,11 +141,21 @@ class ActionGenerator:
         profile_score = self.profiler.get_action_score(user_id, action_type, hour)
         return (base_score + profile_score) / 2
     
-    def _calculate_amplitude(self, current: float, target: float) -> float:
-        """Convertit la différence en amplitude (0-1) pour Naila"""
-        diff = abs(target - current)
-        amplitude = min(1.0, diff / 3.0)  # 0-3°C → 0-1
-        return amplitude
+    def _is_value_on(self, value: Any) -> bool:
+        """Convertit n'importe quel format de valeur en booléen"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0.5  # Seuil 0.5 pour 0.0-1.0
+        return bool(value)
+    
+    def _normalize_value(self, value: Any) -> float:
+        """Normalise une valeur en float 0.0-1.0"""
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return float(max(0.0, min(1.0, value)))
+        return 0.0
     
     # ========== GÉNÉRATION DES ACTIONS SALON ==========
     
@@ -155,61 +163,40 @@ class ActionGenerator:
                                           current_temp: float,
                                           user_target: float,
                                           hour: int) -> List[Action]:
-        """
-        Génère des actions de température pour le salon
-        Basé sur user_target (température cible)
-        """
+        """Génère des actions de température pour le salon"""
         actions = []
-        is_aggressive = self.profiler.should_be_aggressive(user_id) if self.profiler else False
         
-        # Écart par rapport à la cible
+        # Éviter les actions inutiles (écart trop faible)
         ecart = current_temp - user_target
+        if abs(ecart) < 0.5:  # ✅ CORRECTION: Pas d'action si écart < 0.5°C
+            return actions
+        
+        is_aggressive = self.profiler.should_be_aggressive(user_id) if self.profiler else False
         
         if ecart > 1.0:  # Trop chaud
             # Option 1: Activer la clim
-            confidence = self._calculate_confidence(
-                user_id, "activer_clim", hour, 0.9
-            )
+            confidence = self._calculate_confidence(user_id, "activer_clim", hour, 0.9)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ACTIVER_REFROIDISSEMENT_SALON,
                 room="salon",
-                description=f"Activer climatisation salon ({current_temp:.1f}°C → {user_target:.1f}°C)",
+                description=f"Réduire température salon ({current_temp:.1f}°C → {user_target:.1f}°C)",
                 current_value=current_temp,
                 recommended_value=user_target,
                 energy_saving_potential="medium",
                 impact_on_comfort="positive",
                 priority=1,
-                confidence_score=confidence
-            ))
-            
-            # Option 2: Diminuer progressivement
-            confidence = self._calculate_confidence(
-                user_id, "diminuer_temp", hour, 0.7
-            )
-            actions.append(Action(
-                action_id=self._generate_action_id(),
-                action_type=ActionType.DIMINUER_TEMP_SALON,
-                room="salon",
-                description=f"Diminuer température salon de {current_temp:.1f}°C à {current_temp-1:.1f}°C",
-                current_value=current_temp,
-                recommended_value=current_temp - 1,
-                energy_saving_potential="medium",
-                impact_on_comfort="neutral",
-                priority=2,
                 confidence_score=confidence
             ))
             
         elif ecart < -1.0:  # Trop froid
             # Option 1: Activer le chauffage
-            confidence = self._calculate_confidence(
-                user_id, "activer_chauffage", hour, 0.9
-            )
+            confidence = self._calculate_confidence(user_id, "activer_chauffage", hour, 0.9)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ACTIVER_CHAUFFAGE_SALON,
                 room="salon",
-                description=f"Activer chauffage salon ({current_temp:.1f}°C → {user_target:.1f}°C)",
+                description=f"Augmenter température salon ({current_temp:.1f}°C → {user_target:.1f}°C)",
                 current_value=current_temp,
                 recommended_value=user_target,
                 energy_saving_potential="medium",
@@ -217,111 +204,75 @@ class ActionGenerator:
                 priority=1,
                 confidence_score=confidence
             ))
-            
-            # Option 2: Augmenter progressivement
-            confidence = self._calculate_confidence(
-                user_id, "augmenter_temp", hour, 0.7
-            )
-            actions.append(Action(
-                action_id=self._generate_action_id(),
-                action_type=ActionType.AUGMENTER_TEMP_SALON,
-                room="salon",
-                description=f"Augmenter température salon de {current_temp:.1f}°C à {current_temp+1:.1f}°C",
-                current_value=current_temp,
-                recommended_value=current_temp + 1,
-                energy_saving_potential="medium",
-                impact_on_comfort="positive",
-                priority=2,
-                confidence_score=confidence
-            ))
-        
-        # Ajustements fins (si agressif)
-        if is_aggressive and abs(ecart) < 1:
-            target = user_target - 0.5 if ecart > 0 else user_target + 0.5
-            if 16 <= target <= 28:
-                confidence = self._calculate_confidence(
-                    user_id, "ajuster_temp", hour, 0.6
-                )
-                action_type = ActionType.DIMINUER_TEMP_SALON if ecart > 0 else ActionType.AUGMENTER_TEMP_SALON
-                actions.append(Action(
-                    action_id=self._generate_action_id(),
-                    action_type=action_type,
-                    room="salon",
-                    description=f"Ajuster température salon à {target:.1f}°C",
-                    current_value=current_temp,
-                    recommended_value=target,
-                    energy_saving_potential="low",
-                    impact_on_comfort="neutral",
-                    priority=3,
-                    confidence_score=confidence
-                ))
         
         return actions
     
     def generate_light_actions_salon(self, user_id: str,
-                                    current_light: float,
+                                    current_light: Any,
                                     presence: bool,
                                     hour: int) -> List[Action]:
         """Génère des actions d'éclairage pour le salon"""
         actions = []
         
-        # Nuit et présence (20h-6h)
-        if presence and (hour < 6 or hour > 20):
-            if current_light < 0.5:
-                confidence = self._calculate_confidence(
-                    user_id, "allumer_lumiere", hour, 0.85
-                )
-                actions.append(Action(
-                    action_id=self._generate_action_id(),
-                    action_type=ActionType.ALLUMER_LUMIERE_SALON,
-                    room="salon",
-                    description="Allumer lumière salon (nuit, présence)",
-                    current_value=current_light,
-                    recommended_value=0.8,
-                    energy_saving_potential="low",
-                    impact_on_comfort="positive",
-                    priority=2,
-                    confidence_score=confidence
-                ))
+        # ✅ CORRECTION: Normaliser la valeur
+        light_value = self._normalize_value(current_light)
+        light_on = self._is_value_on(current_light)
         
-        # Pas de présence
-        if not presence and current_light > 0.1:
-            confidence = self._calculate_confidence(
-                user_id, "eteindre_lumiere", hour, 0.95
-            )
+        # Pas de présence → éteindre si allumé
+        if not presence and light_on:
+            confidence = self._calculate_confidence(user_id, "eteindre_lumiere", hour, 0.95)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ETEINDRE_LUMIERE_SALON,
                 room="salon",
                 description="Éteindre lumière salon (pièce vide)",
-                current_value=current_light,
-                recommended_value=0,
+                current_value=light_value,
+                recommended_value=0.0,
                 energy_saving_potential="high",
                 impact_on_comfort="neutral",
                 priority=1,
                 confidence_score=confidence
             ))
         
+        # Présence la nuit → allumer si éteint
+        elif presence and (hour < 6 or hour > 20) and not light_on:
+            confidence = self._calculate_confidence(user_id, "allumer_lumiere", hour, 0.85)
+            actions.append(Action(
+                action_id=self._generate_action_id(),
+                action_type=ActionType.ALLUMER_LUMIERE_SALON,
+                room="salon",
+                description="Allumer lumière salon (nuit, présence détectée)",
+                current_value=light_value,
+                recommended_value=0.8,
+                energy_saving_potential="low",
+                impact_on_comfort="positive",
+                priority=2,
+                confidence_score=confidence
+            ))
+        
         return actions
     
     def generate_tv_actions(self, user_id: str,
-                           tv_on: float,
+                           tv_on: Any,
                            presence_salon: bool,
                            hour: int) -> List[Action]:
         """Génère des actions pour la TV"""
         actions = []
         
-        if not presence_salon and tv_on > 0.5:
-            confidence = self._calculate_confidence(
-                user_id, "eteindre_tv", hour, 0.95
-            )
+        # ✅ CORRECTION: Normaliser et vérifier
+        tv_value = self._normalize_value(tv_on)
+        tv_is_on = self._is_value_on(tv_on)
+        
+        # Pas de présence et TV allumée → éteindre
+        if not presence_salon and tv_is_on:
+            confidence = self._calculate_confidence(user_id, "eteindre_tv", hour, 0.95)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ETEINDRE_TV_SALON,
                 room="salon",
-                description="Éteindre TV (personne dans le salon)",
-                current_value=tv_on,
-                recommended_value=0,
+                description="Éteindre TV (personne partie du salon)",
+                current_value=tv_value,
+                recommended_value=0.0,
                 energy_saving_potential="medium",
                 impact_on_comfort="neutral",
                 priority=1,
@@ -339,17 +290,18 @@ class ActionGenerator:
         """Génère des actions de température pour la cuisine"""
         actions = []
         
+        # ✅ CORRECTION: Éviter les actions inutiles
         ecart = current_temp - user_target
+        if abs(ecart) < 0.5:
+            return actions
         
         if ecart > 1.0:  # Trop chaud
-            confidence = self._calculate_confidence(
-                user_id, "eteindre_chauffage_cuisine", hour, 0.85
-            )
+            confidence = self._calculate_confidence(user_id, "eteindre_chauffage_cuisine", hour, 0.85)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ETEINDRE_CHAUFFAGE_CUISINE,
                 room="cuisine",
-                description=f"Éteindre chauffage cuisine ({current_temp:.1f}°C → {user_target:.1f}°C)",
+                description=f"Réduire température cuisine ({current_temp:.1f}°C → {user_target:.1f}°C)",
                 current_value=current_temp,
                 recommended_value=user_target,
                 energy_saving_potential="medium",
@@ -359,14 +311,12 @@ class ActionGenerator:
             ))
             
         elif ecart < -1.0:  # Trop froid
-            confidence = self._calculate_confidence(
-                user_id, "allumer_chauffage_cuisine", hour, 0.85
-            )
+            confidence = self._calculate_confidence(user_id, "allumer_chauffage_cuisine", hour, 0.85)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ALLUMER_CHAUFFAGE_CUISINE,
                 room="cuisine",
-                description=f"Activer chauffage cuisine ({current_temp:.1f}°C → {user_target:.1f}°C)",
+                description=f"Augmenter température cuisine ({current_temp:.1f}°C → {user_target:.1f}°C)",
                 current_value=current_temp,
                 recommended_value=user_target,
                 energy_saving_potential="medium",
@@ -378,22 +328,41 @@ class ActionGenerator:
         return actions
     
     def generate_light_actions_cuisine(self, user_id: str,
-                                      current_light: float,
+                                      current_light: Any,
                                       presence: bool,
                                       hour: int) -> List[Action]:
         """Génère des actions d'éclairage pour la cuisine"""
         actions = []
         
-        if presence and current_light < 0.5:
-            confidence = self._calculate_confidence(
-                user_id, "allumer_lumiere_cuisine", hour, 0.8
-            )
+        # ✅ CORRECTION: Normaliser la valeur
+        light_value = self._normalize_value(current_light)
+        light_on = self._is_value_on(current_light)
+        
+        # Pas de présence → éteindre si allumé
+        if not presence and light_on:
+            confidence = self._calculate_confidence(user_id, "eteindre_lumiere_cuisine", hour, 0.9)
+            actions.append(Action(
+                action_id=self._generate_action_id(),
+                action_type=ActionType.ETEINDRE_LUMIERE_CUISINE,
+                room="cuisine",
+                description="Éteindre lumière cuisine (pièce vide)",
+                current_value=light_value,
+                recommended_value=0.0,
+                energy_saving_potential="high",
+                impact_on_comfort="neutral",
+                priority=1,
+                confidence_score=confidence
+            ))
+        
+        # Présence → allumer si éteint
+        elif presence and not light_on:
+            confidence = self._calculate_confidence(user_id, "allumer_lumiere_cuisine", hour, 0.8)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ALLUMER_LUMIERE_CUISINE,
                 room="cuisine",
-                description="Allumer lumière cuisine",
-                current_value=current_light,
+                description="Allumer lumière cuisine (présence détectée)",
+                current_value=light_value,
                 recommended_value=0.8,
                 energy_saving_potential="low",
                 impact_on_comfort="positive",
@@ -401,45 +370,32 @@ class ActionGenerator:
                 confidence_score=confidence
             ))
         
-        if not presence and current_light > 0.1:
-            confidence = self._calculate_confidence(
-                user_id, "eteindre_lumiere_cuisine", hour, 0.9
-            )
-            actions.append(Action(
-                action_id=self._generate_action_id(),
-                action_type=ActionType.ETEINDRE_LUMIERE_CUISINE,
-                room="cuisine",
-                description="Éteindre lumière cuisine (pièce vide)",
-                current_value=current_light,
-                recommended_value=0,
-                energy_saving_potential="high",
-                impact_on_comfort="neutral",
-                priority=1,
-                confidence_score=confidence
-            ))
-        
         return actions
     
     def generate_hotte_actions(self, user_id: str,
-                              hotte_on: float,
+                              hotte_on: Any,
                               temp_cuisine: float,
-                              temp_precedente: float,
+                              temp_precedente: Optional[float],
                               presence: bool,
                               hour: int) -> List[Action]:
         """Génère des actions pour la hotte"""
         actions = []
-        hausse_temp = temp_cuisine - temp_precedente if temp_precedente else 0
         
-        if presence and hausse_temp > 1.0 and hotte_on < 0.5:
-            confidence = self._calculate_confidence(
-                user_id, "allumer_hotte", hour, 0.85
-            )
+        # ✅ CORRECTION: Normaliser
+        hotte_value = self._normalize_value(hotte_on)
+        hotte_is_on = self._is_value_on(hotte_on)
+        
+        hausse_temp = (temp_cuisine - temp_precedente) if temp_precedente else 0
+        
+        # Détection de cuisson (hausse temp + présence) → allumer si éteint
+        if presence and hausse_temp > 1.0 and not hotte_is_on:
+            confidence = self._calculate_confidence(user_id, "allumer_hotte", hour, 0.85)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ALLUMER_HOTTE_CUISINE,
                 room="cuisine",
-                description="Allumer hotte (augmentation de température détectée)",
-                current_value=hotte_on,
+                description="Allumer hotte (augmentation température détectée)",
+                current_value=hotte_value,
                 recommended_value=1.0,
                 energy_saving_potential="low",
                 impact_on_comfort="positive",
@@ -447,17 +403,16 @@ class ActionGenerator:
                 confidence_score=confidence
             ))
         
-        if not presence and hotte_on > 0.5:
-            confidence = self._calculate_confidence(
-                user_id, "eteindre_hotte", hour, 0.9
-            )
+        # Pas de présence → éteindre si allumé
+        if not presence and hotte_is_on:
+            confidence = self._calculate_confidence(user_id, "eteindre_hotte", hour, 0.9)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ETEINDRE_HOTTE_CUISINE,
                 room="cuisine",
                 description="Éteindre hotte (plus personne en cuisine)",
-                current_value=hotte_on,
-                recommended_value=0,
+                current_value=hotte_value,
+                recommended_value=0.0,
                 energy_saving_potential="medium",
                 impact_on_comfort="neutral",
                 priority=1,
@@ -467,72 +422,56 @@ class ActionGenerator:
         return actions
     
     def generate_four_actions(self, user_id: str,
-                             four_on: float,
+                             four_on: Any,
                              presence: bool,
                              hour: int) -> List[Action]:
         """Génère des actions pour le four"""
         actions = []
         
-        if presence and four_on < 0.5:
-            confidence = self._calculate_confidence(
-                user_id, "allumer_four", hour, 0.7
-            )
-            actions.append(Action(
-                action_id=self._generate_action_id(),
-                action_type=ActionType.ALLUMER_FOUR,
-                room="cuisine",
-                description="Allumer four (prêt à cuisiner)",
-                current_value=four_on,
-                recommended_value=1.0,
-                energy_saving_potential="low",
-                impact_on_comfort="positive",
-                priority=3,
-                confidence_score=confidence
-            ))
+        # ✅ CORRECTION: Normaliser
+        four_value = self._normalize_value(four_on)
+        four_is_on = self._is_value_on(four_on)
         
-        if not presence and four_on > 0.5:
-            confidence = self._calculate_confidence(
-                user_id, "eteindre_four", hour, 0.95
-            )
+        # Pas de présence → éteindre si allumé (SÉCURITÉ!)
+        if not presence and four_is_on:
+            confidence = self._calculate_confidence(user_id, "eteindre_four", hour, 0.99)
             actions.append(Action(
                 action_id=self._generate_action_id(),
                 action_type=ActionType.ETEINDRE_FOUR,
                 room="cuisine",
-                description="Éteindre four (pièce vide)",
-                current_value=four_on,
-                recommended_value=0,
+                description="Éteindre four (SÉCURITÉ: pièce vide)",
+                current_value=four_value,
+                recommended_value=0.0,
                 energy_saving_potential="high",
                 impact_on_comfort="neutral",
-                priority=1,
+                priority=1,  # URGENT pour sécurité
                 confidence_score=confidence
             ))
         
         return actions
     
-    # ========== GÉNÉRATION DE TOUTES LES ACTIONS ==========
-    
     def generate_all_actions(self, user_id: str,
                            current_state: Dict[str, Any],
                            user_prefs: Dict[str, Any]) -> List[Action]:
         """
-        Génère toutes les actions possibles
-        Version compatible avec la nouvelle structure de Naila
+        Génère UNIQUEMENT les actions pertinentes
+        ⭐ VERSION CORRIGÉE - Filtre intelligent
         """
         all_actions = []
         
-        # Extraire l'état (format Naila)
-        temp_salon = current_state.get('temp_salon', 22.0)
-        temp_cuisine = current_state.get('temp_cuisine', 22.0)
-        user_target = current_state.get('user_target', 22.0)
-        presence_salon = current_state.get('presence_salon', False)
-        presence_cuisine = current_state.get('presence_cuisine', False)
+        # Extraire l'état avec valeurs par défaut sûres
+        temp_salon = float(current_state.get('temp_salon', 22.0))
+        temp_cuisine = float(current_state.get('temp_cuisine', 22.0))
+        user_target = float(current_state.get('user_target', 22.0))
+        presence_salon = bool(current_state.get('presence_salon', False))
+        presence_cuisine = bool(current_state.get('presence_cuisine', False))
         lumiere_salon = current_state.get('lumiere_salon', 0.0)
         lumiere_cuisine = current_state.get('lumiere_cuisine', 0.0)
         tv_on = current_state.get('tv_on', 0.0)
         four_on = current_state.get('four_on', 0.0)
         hotte_on = current_state.get('hotte_on', 0.0)
-        temp_cuisine_precedente = current_state.get('temp_cuisine_precedente', temp_cuisine)
-        heure = current_state.get('heure', 12)
+        temp_cuisine_precedente = current_state.get('temp_cuisine_precedente', None)
+        heure = int(current_state.get('heure', 12))
         
         # Actions Salon
         all_actions.extend(self.generate_temperature_actions_salon(
